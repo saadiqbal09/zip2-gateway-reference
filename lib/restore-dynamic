@@ -1,0 +1,5 @@
+#!/bin/sh
+# 정책 재적용/재부팅으로 비워진 격리·차단 셋 원소를 커널에 되살린다.
+set -eu
+export PYTHONPATH="${MOOKER_HOME:-/opt/mooker-gateway}${PYTHONPATH:+:$PYTHONPATH}"
+exec /usr/bin/python3 -m router.cli restore-dynamic

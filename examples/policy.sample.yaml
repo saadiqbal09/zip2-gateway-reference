@@ -1,0 +1,203 @@
+# 정책 문서 참고용 YAML (사람이 읽기 위한 형식이다).
+#
+# Gateway가 실제로 받아들이는 것은 서명된 JSON 봉투다. 서명 대상 정규화가
+# JSON 기준이므로 YAML을 그대로 보내지 않는다. 중앙에서 이 YAML을 편집한 뒤
+# JSON으로 변환해 서명한다.
+#
+#   python3 -c 'import json,sys,yaml; json.dump(yaml.safe_load(open(sys.argv[1])), \
+#     open(sys.argv[2],"w"), ensure_ascii=False)' policy.yaml policy.json
+#   # 그 다음 중앙 서명 서비스(HSM/KMS)로 봉투를 만든다
+#
+# 각 항목의 의미와 검증 규칙은 gateway/router/model.py 를 정본으로 본다.
+
+schema_version: 1
+revision: 42                          # 반드시 증가한다. 되감기는 거부된다.
+gateway_id: 6f1c9a3e-2b47-4d51-9a0c-8e7d5b1f2a34
+tenant: mooker-customer-a
+site: seoul-01
+generated_at: "2026-08-27T09:00:00Z"
+ip_forward: true
+ipv6_forward: false
+
+wan_links:
+  # 주 회선: DHCP. metric이 작을수록 우선한다.
+  - name: wan1
+    interface: ens18
+    mode: dhcp4
+    metric: 100
+    weight: 3
+    probes:                           # 회선 생존/품질 판정 근거
+      - {kind: icmp, target: 1.1.1.1}
+      - {kind: tcp, target: 1.1.1.1, port: 443}
+      - {kind: dns, target: 1.1.1.1, hostname: www.example.com}
+
+  # 보조 회선: 고정 IP + 전용 라우팅 테이블(정책 라우팅).
+  - name: wan2
+    interface: ens19
+    mode: static
+    addresses: [203.0.113.2/30]
+    gateway4: 203.0.113.1
+    metric: 200
+    table: 200
+    required_for_online: false        # 부팅 시 이 회선을 기다리지 않는다
+    probes:
+      - {kind: icmp, target: 9.9.9.9}
+
+  # PPPoE 예시 (위 wan1을 대체할 때 사용).
+  # - name: wan1
+  #   interface: ens18
+  #   mode: pppoe
+  #   metric: 100
+  #   pppoe:
+  #     username: "user@isp"
+  #     password_ref: wan1-pppoe      # /etc/mooker/secrets/wan1-pppoe 파일을 읽는다
+  #     mtu: 1492
+
+bridges:
+  - name: br-lan
+    ports: [ens20, ens21, ens22]
+    vlan_filtering: true              # VLAN-aware bridge (networkd 드롭인으로 구성)
+    default_pvid: 1
+    trunk_ports: [ens22]              # 모든 VLAN을 tagged로 전달 (AP/상위 스위치)
+    isolated_ports: []                # 포트 간 직접 통신 차단이 필요한 포트
+    drop_rogue_dhcp: true             # LAN 포트에서 오는 DHCP 응답을 폐기
+
+lans:
+  - name: mgmt
+    interface: vl-mgmt                # 생성될 리눅스 디바이스 이름
+    zone: mgmt
+    vlan_id: 10
+    vlan_link: br-lan
+    addresses: [10.10.10.1/24]
+    untagged_ports: [ens20]           # 이 포트는 VLAN 10의 access 포트가 된다
+    dhcp:
+      subnet: 10.10.10.0/24
+      pool_start: 10.10.10.100
+      pool_end: 10.10.10.200
+      domain_name: mgmt.seoul01.mooker.internal
+      lease_lifetime_s: 3600
+
+  - name: staff
+    interface: vl-staff
+    zone: staff
+    vlan_id: 20
+    vlan_link: br-lan
+    addresses: [10.20.0.1/24]
+    untagged_ports: [ens21]
+    dhcp:
+      subnet: 10.20.0.0/24
+      pool_start: 10.20.0.100
+      pool_end: 10.20.0.200
+      lease_lifetime_s: 7200
+      reservations:                   # 고정 주소는 동적 pool 밖이어야 한다
+        - {mac: "AA:BB:CC:DD:EE:01", ip: 10.20.0.50, hostname: office-nas}
+
+  - name: guest
+    interface: vl-guest
+    zone: guest
+    vlan_id: 30
+    vlan_link: br-lan
+    addresses: [10.30.0.1/24]
+    client_isolation: true            # 같은 세그먼트 단말 간 통신 차단
+    dhcp: {subnet: 10.30.0.0/24, pool_start: 10.30.0.50, pool_end: 10.30.0.250}
+
+  - name: quarantine
+    interface: vl-quar
+    zone: quarantine
+    vlan_id: 99
+    vlan_link: br-lan
+    addresses: [10.99.0.1/24]
+    client_isolation: true
+    dhcp:
+      subnet: 10.99.0.0/24
+      pool_start: 10.99.0.50
+      pool_end: 10.99.0.250
+      lease_lifetime_s: 600
+
+firewall:
+  zones: [wan, mgmt, staff, guest, quarantine]   # 'wan'은 WAN 인터페이스를 뜻하는 예약 zone
+  masquerade_wans: [wan1, wan2]
+  default_forward: drop
+  zone_forward:                       # 넓은 허용 (매트릭스)
+    - {from: mgmt, to: wan}
+    - {from: staff, to: wan}
+    - {from: guest, to: wan}
+    - {from: mgmt, to: staff}
+  forward_rules:                      # 명시 규칙이 매트릭스보다 먼저 평가된다
+    - name: guest-no-private
+      from_zone: guest
+      to_zone: wan
+      action: drop
+      destination_cidrs: [10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16]
+      log: true
+    - name: quarantine-no-forward
+      from_zone: quarantine
+      to_zone: wan
+      action: drop
+      log: true
+  service_allows:                     # Gateway 자신으로의 접근 (WAN zone은 금지)
+    - {zone: mgmt, protocol: tcp, ports: [22], source_cidrs: [10.10.10.0/24],
+       comment: 현장 콘솔 SSH}
+  port_forwards:
+    - name: nas-https
+      wan: wan1
+      protocol: tcp
+      wan_port: 8443
+      to_address: 10.20.0.50
+      to_port: 443
+      source_cidrs: [198.51.100.0/24]
+  mgmt_allow_cidrs: [10.10.10.0/24, 10.88.0.0/24]   # 비우면 정책이 거부된다
+  mgmt_ssh_port: 22
+  quarantine_allow_dhcp_dns: true
+  captive_portal_ipv4: 10.99.0.1
+  log_dropped: true
+  mss_clamp: true                     # PPPoE/터널 경로의 MTU 문제 방지
+  invalid_ct_drop: true
+
+dns:
+  enabled: true
+  listen_segments: [mgmt, staff, guest, quarantine]
+  forwarders: [1.1.1.1, 9.9.9.9]
+  forward_tls: true                   # DoT (853)
+  forward_tls_hostnames: [cloudflare-dns.com, dns.quad9.net]
+  blocked_domains: [malware-example.test, phishing-example.test]
+  allowed_domains: [update.mooker.io]
+  log_queries: false                  # 조사 기간에만 켠다 (syslog 부하)
+  cache_max_mb: 64
+  minimal_responses: true
+
+qos:
+  - wan: wan1
+    enabled: true
+    download_mbit: 480                # 실측 회선 속도의 90~95%로 설정한다
+    upload_mbit: 95
+    mode: diffserv4
+    rtt_ms: 40
+    nat: true
+    ack_filter: true
+    ingress_shaping: true             # IFB + CAKE로 하향도 제어
+
+mgmt_tunnel:
+  enabled: false                      # true로 바꾸기 전에 secret을 배치한다
+  interface: mooker-mgmt
+  address: 10.88.0.11/32
+  private_key_ref: mgmt-wg-private    # /etc/mooker/secrets/mgmt-wg-private
+  peer_public_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+  peer_endpoint: mgmt.mooker.io:51820
+  allowed_ips: [10.88.0.0/24]         # 0.0.0.0/0 은 거부된다 (최소 권한)
+  keepalive_s: 25
+  mtu: 1380
+
+commit_confirm:
+  timeout_s: 300                      # 이 시간 내 confirm이 없으면 자동 복구
+  require_central_confirm: true
+
+verify:
+  require_wan_online: true
+  require_dns: true
+  require_control_plane: true
+  require_mgmt_tunnel: false
+  control_plane_url: https://api.mooker.io/healthz
+  dns_probe_name: www.example.com
+  per_check_timeout_s: 5.0
+  settle_delay_s: 3.0                 # DHCP 재획득/링크 협상 대기

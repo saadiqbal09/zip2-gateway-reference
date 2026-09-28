@@ -1,0 +1,46 @@
+[Unit]
+Description=Mooker Gateway Agent (중앙 정책 동기화 / telemetry / 격리)
+Documentation=file:///opt/mooker-gateway/docs/router-plane.md
+Wants=network-online.target
+After=network-online.target mooker-nftables.service
+# Agent가 반복 실패해도 systemd가 포기하지 않게 한다. 현장에 사람이 없다.
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+WorkingDirectory=/opt/mooker-gateway
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONPATH=/opt/mooker-gateway
+EnvironmentFile=-/etc/mooker/agent.env
+ExecStart=/usr/bin/python3 -m agent.main
+Restart=always
+RestartSec=5s
+WatchdogSec=0
+
+# 네트워크 설정을 바꾸므로 root가 필요하다. 대신 표면을 좁힌다.
+User=root
+ProtectHome=yes
+ProtectSystem=full
+ProtectKernelLogs=yes
+ProtectClock=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+PrivateTmp=yes
+# 정책이 실제로 써야 하는 경로만 다시 열어준다.
+ReadWritePaths=/etc/netplan
+ReadWritePaths=/etc/systemd/network
+ReadWritePaths=/etc/mooker
+ReadWritePaths=/etc/kea
+ReadWritePaths=/etc/unbound
+ReadWritePaths=/etc/wireguard
+ReadWritePaths=/etc/ppp
+ReadWritePaths=/etc/sysctl.d
+ReadWritePaths=/var/lib/mooker-router
+ReadWritePaths=/var/lib/mooker-agent
+ReadWritePaths=/var/log
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_MODULE CAP_DAC_OVERRIDE CAP_CHOWN CAP_FOWNER CAP_SETUID CAP_SETGID
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW
+
+[Install]
+WantedBy=multi-user.target

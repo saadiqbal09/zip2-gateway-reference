@@ -1,0 +1,130 @@
+# 개발/랩 정책 — SSH로 접속한 채로 안전하게 적용하기 위한 최소 구성
+#
+# ┌──────────────────────────────────────────────────────────────────────────┐
+# │ 이 정책의 단 하나의 목적: 관리용 SSH 접속을 끊지 않는 것.                 │
+# └──────────────────────────────────────────────────────────────────────────┘
+#
+# 두 가지 장치로 그것을 보장한다.
+#
+#  1) 관리 NIC을 정책에 넣지 않는다.
+#     Router Plane은 /etc/netplan/90-mooker.yaml 하나만 소유하고, 그 파일에는
+#     정책에 등장하는 인터페이스만 들어간다. 관리 NIC(예: enp1s0)을 여기에
+#     쓰지 않으면 기존 netplan 설정(50-cloud-init.yaml 등)이 그대로 유지된다.
+#
+#  2) mgmt_allow_cidrs에 개발 PC 대역을 넣는다.
+#     nftables input chain은 policy drop이다. 이 목록에 없는 출발지에서 오는
+#     새 SSH 연결은 차단된다. 기존 연결은 ct established로 살아남지만, 재접속이
+#     막히면 사실상 잠긴 것과 같다.
+#
+#  그리고 commit_confirm.mode: manual —
+#     검증을 통과해도 사람이 `mooker-router confirm`을 칠 때까지 자동 복구 예약이
+#     유지된다. SSH가 끊기면 confirm을 칠 수 없으므로 타이머가 되돌린다.
+#     원격 작업 중에 이보다 나은 안전장치는 없다.
+#
+# ── 채워야 하는 값 ──────────────────────────────────────────────────────────
+#   gateway_id      : mooker-router 실행 시 --gateway-id 와 같아야 한다
+#   wan_links[0].interface : 공유기에 연결된 NIC (관리 NIC과 달라야 한다)
+#   bridges[0].ports       : LAN 쪽 물리 포트. 없으면 아래 dummy 안내 참고
+#   mgmt_allow_cidrs       : 개발 PC가 있는 대역
+# ───────────────────────────────────────────────────────────────────────────
+
+schema_version: 1
+revision: 1                       # 적용할 때마다 올린다 (sign 시 --bump)
+gateway_id: dev-lab-gateway
+tenant: mooker-dev
+site: dev-lab
+generated_at: "2026-08-27T00:00:00Z"
+ip_forward: true
+ipv6_forward: false
+
+wan_links:
+  - name: wan1
+    interface: enp2s0             # ★ 공유기에 연결된 NIC. 관리 NIC이 아니어야 한다
+    mode: dhcp4
+    metric: 100
+    probes:
+      - {kind: icmp, target: 192.168.0.1}    # 공유기
+      - {kind: icmp, target: 1.1.1.1}
+
+bridges:
+  - name: br-lab
+    ports: [lab0]                 # ★ LAN 물리 포트. 없으면 dummy(아래 참고)
+    vlan_filtering: false         # 랩에서는 VLAN 없이 시작한다
+    drop_rogue_dhcp: false        # 랩에서는 끄고 시작 (오탐 소지를 줄인다)
+
+lans:
+  - name: lab
+    interface: br-lab
+    zone: lab
+    addresses: [10.77.0.1/24]
+    description: 개발용 LAN
+    dhcp:
+      subnet: 10.77.0.0/24
+      pool_start: 10.77.0.100
+      pool_end: 10.77.0.200
+      lease_lifetime_s: 600
+
+vrfs: []
+
+firewall:
+  zones: [wan, lab]
+  masquerade_wans: [wan1]
+  default_forward: drop
+  zone_forward:
+    - {from: lab, to: wan}
+  forward_rules: []
+  service_allows: []              # SSH는 아래 mgmt_allow_cidrs로 허용된다
+  port_forwards: []
+  # ★ 여기에 개발 PC 대역이 없으면 적용 직후 SSH 재접속이 막힌다.
+  #   LAN으로 관리 경로를 옮기기 전까지 두 대역을 모두 남겨 둔다.
+  mgmt_allow_cidrs:
+    - 192.168.0.0/24              # 공유기 대역 (현재 SSH 경로)
+    - 10.77.0.0/24                # 게이트웨이 LAN (나중에 옮겨갈 경로)
+  mgmt_ssh_port: 22
+  quarantine_allow_dhcp_dns: true
+  log_dropped: true
+  mss_clamp: true
+  invalid_ct_drop: true
+
+dns:
+  enabled: true
+  listen_segments: [lab]
+  forwarders: [192.168.0.1]       # 랩에서는 공유기 DNS를 그대로 쓴다
+  forward_tls: false              # DoT는 WAN 직결 후에 켠다
+  blocked_domains: []
+  log_queries: false
+  cache_max_mb: 16
+
+qos: []                           # 랩에서는 끄고 시작 (회선 실측 후 켠다)
+
+mgmt_tunnel:
+  enabled: false
+
+commit_confirm:
+  mode: manual                    # ★ 사람이 confirm. SSH가 끊기면 자동 복구된다
+  timeout_s: 120                  # 개발 중에는 짧게. 실수해도 2분이면 돌아온다
+
+verify:
+  require_wan_online: true
+  require_dns: true
+  require_control_plane: false    # 중앙 플랫폼이 아직 없다
+  require_mgmt_tunnel: false
+  control_plane_url: ""
+  dns_probe_name: www.example.com
+  per_check_timeout_s: 5.0
+  settle_delay_s: 5.0             # DHCP 재획득 대기
+
+# ── LAN 물리 포트가 없을 때 (NIC 2개뿐인 장비) ────────────────────────────────
+# dummy 인터페이스로 LAN을 시뮬레이션하면 DHCP·DNS·방화벽·NAT 경로를 전부
+# 시험할 수 있다. Router Plane이 소유하지 않는 파일이므로 정책과 충돌하지 않는다.
+#
+#   sudo tee /etc/systemd/network/05-lab-dummy.netdev >/dev/null <<'NETDEV'
+#   [NetDev]
+#   Name=lab0
+#   Kind=dummy
+#   NETDEV
+#   sudo systemctl restart systemd-networkd
+#   ip link show lab0        # 생성 확인
+#
+# 실제 단말을 붙여 시험하려면 LAN 포트가 있는 NIC(USB 이더넷도 충분하다)를
+# 하나 더 달고 ports를 그 이름으로 바꾼다.

@@ -1,0 +1,16 @@
+# 현장 Gateway 의존성
+#
+# Router Plane과 Agent는 Python 표준 라이브러리만 쓴다. 현장 장비에 pip 설치
+# 표면을 만들지 않기 위한 의도적 제약이다(YAML 에미터, DNS 질의, JSON 정규화를
+# 직접 구현한 이유).
+#
+# 유일한 예외는 정책 서명 검증용 cryptography다. Ubuntu 24.04에서는
+# apt 패키지를 쓴다:
+#
+#     apt install python3-cryptography
+#
+# pip로 설치할 경우에만 아래를 사용한다.
+cryptography==44.0.0
+
+# 테스트용 (현장 장비에는 설치하지 않는다)
+# pytest

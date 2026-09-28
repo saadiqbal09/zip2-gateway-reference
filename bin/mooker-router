@@ -1,0 +1,5 @@
+#!/bin/sh
+# Mooker Router Plane CLI 래퍼.
+set -eu
+export PYTHONPATH="${MOOKER_HOME:-/opt/mooker-gateway}${PYTHONPATH:+:$PYTHONPATH}"
+exec /usr/bin/python3 -m router.cli "$@"

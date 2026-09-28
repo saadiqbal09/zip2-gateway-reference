@@ -1,0 +1,114 @@
+# Mooker 개발 게이트웨이 (ProLiant DL20 Gen11) 랩 정책
+#
+#   eno1  192.168.0.3   관리 — SSH가 들어오는 NIC. 이 정책에 절대 등장하지 않는다.
+#   eno2                WAN  — 공유기에 연결 (아직 케이블이 없어도 된다)
+#   eno3                LAN  — 단말/스위치 연결
+#   lab0                dummy — 케이블이 없어도 br-lab이 UP 상태를 유지하게 한다
+#
+# 단계적으로 켠다. 각 단계마다 revision을 올려 다시 서명한다(--bump).
+#
+#   1단계  케이블 없이 적용     : 파이프라인 전체가 도는지 확인 (현재 설정)
+#   2단계  eno3에 단말 연결     : DHCP 주소 수령, DNS 질의 확인
+#   3단계  eno2를 공유기에 연결 : required_for_online / require_wan_online 을 true로
+#
+# ── 1단계에서 두 값이 false인 이유 ────────────────────────────────────────────
+#   케이블이 없으면 WAN에 주소가 없다. true로 두면 연결 검증이 hard 실패로 판정해
+#   정상 적용을 되돌려 버린다. 코드가 잘못된 것과 케이블이 없는 것을 구분해야 한다.
+# ───────────────────────────────────────────────────────────────────────────
+
+schema_version: 1
+revision: 1
+gateway_id: mooker-lab-gw          # mooker-router --gateway-id 와 반드시 일치
+tenant: mooker-dev
+site: dev-lab
+generated_at: "2026-08-27T00:00:00Z"
+ip_forward: true
+ipv6_forward: false
+
+wan_links:
+  - name: wan1
+    interface: eno2
+    mode: dhcp4
+    # eno1(관리)의 기본 경로보다 우선하게 둔다. LAN에서 나가는 트래픽이 eno2로
+    # 나가야 아래 masquerade 규칙과 짝이 맞는다. eno1로 나가면 NAT되지 않아
+    # 공유기가 버린다.
+    #
+    # SSH는 영향을 받지 않는다. 192.168.0.0/24 는 직접 연결된 대역이라
+    # 기본 경로를 타지 않는다.
+    metric: 50
+    required_for_online: false     # 3단계에서 true
+    probes:
+      - {kind: icmp, target: 192.168.0.1}
+      - {kind: icmp, target: 1.1.1.1}
+
+bridges:
+  - name: br-lab
+    # lab0(dummy)를 함께 넣어 두면 eno3에 케이블이 없어도 브리지가 UP을 유지한다.
+    # 이것이 없으면 첫 적용에서 "interface:br-lab operstate=DOWN"으로 검증이
+    # 실패하고 자동 복구된다.
+    ports: [eno3, lab0]
+    vlan_filtering: false          # 랩에서는 VLAN 없이 시작한다
+    drop_rogue_dhcp: false         # 랩에서는 끄고 시작
+
+lans:
+  - name: lab
+    interface: br-lab
+    zone: lab
+    addresses: [10.77.0.1/24]
+    description: 개발용 LAN (eno3)
+    dhcp:
+      subnet: 10.77.0.0/24
+      pool_start: 10.77.0.100
+      pool_end: 10.77.0.200
+      lease_lifetime_s: 600
+
+vrfs: []
+
+firewall:
+  zones: [wan, lab]
+  masquerade_wans: [wan1]
+  default_forward: drop
+  zone_forward:
+    - {from: lab, to: wan}
+  forward_rules: []
+  service_allows: []
+  port_forwards: []
+  # ★ 이 목록이 SSH 생명줄이다. 192.168.0.0/24 를 지우면 관리 접속이 끊긴다.
+  mgmt_allow_cidrs:
+    - 192.168.0.0/24               # 현재 관리 경로 (공유기 대역)
+    - 10.77.0.0/24                 # 나중에 옮겨갈 LAN 경로
+  mgmt_ssh_port: 22
+  quarantine_allow_dhcp_dns: true
+  log_dropped: true
+  mss_clamp: true
+  invalid_ct_drop: true
+
+dns:
+  enabled: true
+  listen_segments: [lab]
+  # 공유기를 상위 resolver로 쓴다. 관리 NIC(eno1)으로 도달하므로 WAN 케이블이
+  # 없어도 DNS 검증이 통과한다.
+  forwarders: [192.168.0.1]
+  forward_tls: false               # DoT는 WAN 직결 후에 켠다
+  blocked_domains: []
+  log_queries: false
+  cache_max_mb: 16
+
+qos: []                            # 회선 실측 후에 켠다
+
+mgmt_tunnel:
+  enabled: false
+
+commit_confirm:
+  mode: manual                     # 사람이 confirm. SSH가 끊기면 자동 복구된다
+  timeout_s: 120
+
+verify:
+  require_wan_online: false        # 3단계에서 true
+  require_dns: true
+  require_control_plane: false     # 중앙 플랫폼이 아직 없다
+  require_mgmt_tunnel: false
+  control_plane_url: ""
+  dns_probe_name: www.example.com
+  per_check_timeout_s: 5.0
+  settle_delay_s: 5.0

@@ -1,0 +1,29 @@
+[Unit]
+Description=Mooker Gateway nftables 정책 (inet mooker / bridge mooker_l2)
+Documentation=file:///opt/mooker-gateway/docs/router-plane.md
+# 방화벽은 인터페이스가 주소를 받기 전에 서 있어야 한다. network-pre.target 앞에
+# 두는 것이 systemd에서의 표준 방식이다.
+Wants=network-pre.target
+Before=network-pre.target
+DefaultDependencies=no
+After=sysinit.target local-fs.target
+Conflicts=shutdown.target
+Before=shutdown.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# 우리 테이블만 교체한다. 고객이 쓰는 다른 nftables 테이블은 건드리지 않는다.
+ExecStart=/usr/sbin/nft -f /etc/mooker/nftables/10-mooker-inet.nft
+# bridge 테이블은 커널 지원이 없을 수 있다. 실패해도 L3 정책은 유지한다.
+ExecStart=-/usr/sbin/nft -f /etc/mooker/nftables/20-mooker-bridge.nft
+# 재부팅으로 비워진 격리/차단 셋 원소를 되살린다.
+ExecStart=-/usr/local/bin/mooker-router restore-dynamic
+ExecReload=/usr/sbin/nft -f /etc/mooker/nftables/10-mooker-inet.nft
+ExecReload=-/usr/sbin/nft -f /etc/mooker/nftables/20-mooker-bridge.nft
+ExecReload=-/usr/local/bin/mooker-router restore-dynamic
+ExecStop=-/usr/sbin/nft delete table inet mooker
+ExecStop=-/usr/sbin/nft delete table bridge mooker_l2
+
+[Install]
+WantedBy=multi-user.target

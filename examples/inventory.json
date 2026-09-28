@@ -1,0 +1,11 @@
+{
+  "nodes": [
+    {"node_key": "switch-a", "node_type": "switch", "parent_key": "gateway", "details": {"management_ip": "192.168.10.2", "model": "managed-switch", "source": "snmpv3"}},
+    {"node_key": "ap-mesh-01", "node_type": "mesh_node", "parent_key": "switch-a", "details": {"management_ip": "192.168.10.20", "backhaul": "wired"}},
+    {"node_key": "ap-mesh-02", "node_type": "ap", "parent_key": "ap-mesh-01", "details": {"management_ip": "192.168.10.21", "backhaul": "wireless"}}
+  ],
+  "devices": [
+    {"mac": "AA:BB:CC:DD:EE:01", "ip_addresses": ["192.168.20.10"], "hostname": "Office-PC", "attachment": {"kind": "wired", "confidence": "confirmed", "node_key": "switch-a", "port": "Gi1/0/17", "vlan_id": 20, "ssid": null, "bssid": null, "band": null, "rssi_dbm": null}},
+    {"mac": "AA:BB:CC:DD:EE:02", "ip_addresses": ["192.168.30.21"], "hostname": "Tablet", "attachment": {"kind": "wireless", "confidence": "confirmed", "node_key": "ap-mesh-02", "port": null, "vlan_id": 30, "ssid": "Mooker-Staff", "bssid": "02:11:22:33:44:55", "band": "5GHz", "rssi_dbm": -54}}
+  ]
+}

@@ -1,0 +1,179 @@
+"""Mooker Gateway Agent MVP.
+
+Default mode is safe: it reports a fixture inventory and never alters firewall rules.
+Set ENFORCEMENT_MODE=nft only after creating the dedicated nftables table and testing
+on an isolated gateway.
+"""
+import base64
+import hashlib
+import hmac
+import json
+import os
+import re
+import subprocess
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+PLATFORM_URL = os.getenv("PLATFORM_URL", "http://127.0.0.1:8080").rstrip("/")
+GATEWAY_NAME = os.getenv("GATEWAY_NAME", "mooker-gateway")
+ENROLLMENT_TOKEN = os.getenv("ENROLLMENT_TOKEN", "")
+STATE_PATH = Path(os.getenv("STATE_PATH", "/var/lib/mooker-agent/state.json"))
+FIXTURE_PATH = Path(os.getenv("FIXTURE_PATH", "/examples/inventory.json"))
+COLLECTOR_MODE = os.getenv("COLLECTOR_MODE", "fixture")
+ENFORCEMENT_MODE = os.getenv("ENFORCEMENT_MODE", "dry-run")
+INTERVAL_SECONDS = max(10, int(os.getenv("INTERVAL_SECONDS", "30")))
+MAC_RE = re.compile(r"^[0-9A-F]{2}(:[0-9A-F]{2}){5}$")
+
+def load_state() -> dict:
+    try:
+        return json.loads(STATE_PATH.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+def save_state(state: dict) -> None:
+    STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+    tmp = STATE_PATH.with_suffix(".tmp")
+    tmp.write_text(json.dumps(state, indent=2))
+    tmp.replace(STATE_PATH)
+
+def request(method: str, path: str, payload: dict | None = None, state: dict | None = None) -> dict:
+    body = json.dumps(payload, separators=(",", ":")).encode() if payload is not None else b""
+    headers = {"Content-Type": "application/json"}
+    if state and state.get("gateway_id") and state.get("agent_secret"):
+        timestamp = str(int(time.time()))
+        canonical = b"\n".join([method.encode(), path.encode(), timestamp.encode(), body])
+        headers.update({
+            "X-Gateway-ID": state["gateway_id"],
+            "X-Timestamp": timestamp,
+            "X-Signature": hmac.new(state["agent_secret"].encode(), canonical, hashlib.sha256).hexdigest(),
+        })
+    req = urllib.request.Request(PLATFORM_URL + path, body or None, headers, method=method)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return json.loads(response.read() or b"{}")
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"platform HTTP {exc.code}: {exc.read().decode(errors='replace')}") from exc
+    except urllib.error.URLError as exc:
+        raise RuntimeError(f"platform unreachable: {exc.reason}") from exc
+
+def enroll(state: dict) -> dict:
+    if state.get("gateway_id") and state.get("agent_secret"):
+        return state
+    gateway_id = os.getenv("GATEWAY_ID", "")
+    if not gateway_id or not ENROLLMENT_TOKEN:
+        raise RuntimeError("GATEWAY_ID and ENROLLMENT_TOKEN are required for first enrollment")
+    response = request("POST", "/api/v1/gateway/enroll", {"gateway_id": gateway_id,
+                       "enrollment_token": ENROLLMENT_TOKEN, "agent_version": "0.1.0"})
+    state.update(response)
+    save_state(state)
+    return state
+
+def normalize_mac(value: str) -> str:
+    value = value.upper().replace("-", ":")
+    if not MAC_RE.fullmatch(value):
+        raise ValueError(f"invalid MAC: {value!r}")
+    return value
+
+def fixture_inventory() -> dict:
+    try:
+        data = json.loads(FIXTURE_PATH.read_text())
+    except FileNotFoundError:
+        return {"devices": [], "nodes": []}
+    for device in data.get("devices", []):
+        device["mac"] = normalize_mac(device["mac"])
+    return data
+
+def linux_inventory() -> dict:
+    """Conservative Linux collector. It only identifies direct bridge-FDB clients.
+    Managed downstream switch port identification belongs in an SNMPv3 collector.
+    """
+    devices, nodes = [], []
+    try:
+        output = subprocess.run(["bridge", "fdb", "show"], capture_output=True, text=True, timeout=5, check=True).stdout
+    except (OSError, subprocess.SubprocessError):
+        return {"devices": devices, "nodes": nodes}
+    for line in output.splitlines():
+        fields = line.split()
+        if len(fields) < 3 or "dev" not in fields:
+            continue
+        try:
+            mac, iface = normalize_mac(fields[0]), fields[fields.index("dev") + 1]
+        except (ValueError, IndexError):
+            continue
+        if "self" in fields or "permanent" in fields:
+            continue
+        devices.append({"mac": mac, "ip_addresses": [], "hostname": "Unknown",
+                        "attachment": {"kind": "wired", "confidence": "inferred", "node_key": "gateway",
+                                       "port": iface, "vlan_id": None, "ssid": None, "bssid": None,
+                                       "band": None, "rssi_dbm": None}})
+    return {"devices": devices, "nodes": nodes}
+
+class Enforcement:
+    """Applies only validated MAC entries. Unknown devices are observed by default.
+    A production adapter must use desired/applied revisions and nft JSON verification.
+    """
+    def __init__(self, mode: str):
+        self.mode = mode
+
+    def apply_whitelist(self, policy: dict) -> dict:
+        macs = [normalize_mac(item["mac"]) for item in policy.get("whitelist", [])]
+        quarantine = [normalize_mac(item["mac"]) for item in policy.get("quarantine", [])]
+        if self.mode == "dry-run":
+            return {"mode": "dry-run", "whitelisted_macs": len(macs), "quarantined_macs": len(quarantine)}
+        if self.mode != "nft":
+            raise RuntimeError("unsupported enforcement mode")
+        # Dedicated table/set prevents replacement of customer-owned firewall policy.
+        exists = subprocess.run(["nft", "list", "table", "inet", "mooker_agent"], capture_output=True, timeout=5).returncode == 0
+        if not exists:
+            init = "\n".join([
+                "add table inet mooker_agent",
+                "add set inet mooker_agent whitelist_macs { type ether_addr; }",
+                "add set inet mooker_agent quarantine_macs { type ether_addr; }",
+                "add chain inet mooker_agent mooker_forward { type filter hook forward priority -10; policy accept; }",
+                "add rule inet mooker_agent mooker_forward ether saddr @quarantine_macs counter drop",
+                "",
+            ])
+            result = subprocess.run(["nft", "-f", "-"], input=init.encode(), capture_output=True, timeout=8)
+            if result.returncode:
+                raise RuntimeError("nft initialization failed: " + result.stderr.decode(errors="replace"))
+        ruleset = "flush set inet mooker_agent whitelist_macs\n"
+        if macs:
+            ruleset += "add element inet mooker_agent whitelist_macs { " + ", ".join(macs) + " }\n"
+        ruleset += "flush set inet mooker_agent quarantine_macs\n"
+        if quarantine:
+            ruleset += "add element inet mooker_agent quarantine_macs { " + ", ".join(quarantine) + " }\n"
+        result = subprocess.run(["nft", "-f", "-"], input=ruleset.encode(), capture_output=True, timeout=8)
+        if result.returncode:
+            raise RuntimeError("nft apply failed: " + result.stderr.decode(errors="replace"))
+        return {"mode": "nft", "whitelisted_macs": len(macs), "quarantined_macs": len(quarantine)}
+
+def run() -> None:
+    state = enroll(load_state())
+    enforcement = Enforcement(ENFORCEMENT_MODE)
+    last_revision = -1
+    while True:
+        try:
+            health = {"agent": "healthy", "gateway_name": GATEWAY_NAME,
+                      "collector_mode": COLLECTOR_MODE, "enforcement_mode": ENFORCEMENT_MODE,
+                      "time": datetime.now(timezone.utc).isoformat()}
+            hb = request("POST", "/api/v1/gateway/heartbeat", {"health": health}, state)
+            policy = request("GET", "/api/v1/gateway/policy", None, state)
+            # Reapply defensively: a time-bounded quarantine can expire while the
+            # revision remains unchanged, and the nft set is intentionally rebuilt
+            # only inside this agent-owned table.
+            enforcement.apply_whitelist(policy)
+            if policy["revision"] != last_revision:
+                last_revision = policy["revision"]
+                state["applied_policy_revision"] = last_revision
+                save_state(state)
+            inventory = fixture_inventory() if COLLECTOR_MODE == "fixture" else linux_inventory()
+            request("POST", "/api/v1/gateway/inventory", inventory, state)
+        except Exception as exc:
+            print(f"agent cycle failed: {exc}", flush=True)
+        time.sleep(INTERVAL_SECONDS)
+
+if __name__ == "__main__":
+    run()

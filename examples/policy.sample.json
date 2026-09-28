@@ -1,0 +1,238 @@
+{
+  "schema_version": 1,
+  "revision": 42,
+  "gateway_id": "6f1c9a3e-2b47-4d51-9a0c-8e7d5b1f2a34",
+  "tenant": "mooker-customer-a",
+  "site": "seoul-01",
+  "generated_at": "2026-08-27T09:00:00Z",
+  "ip_forward": true,
+  "ipv6_forward": false,
+
+  "wan_links": [
+    {
+      "name": "wan1",
+      "interface": "ens18",
+      "mode": "dhcp4",
+      "metric": 100,
+      "weight": 3,
+      "probes": [
+        {"kind": "icmp", "target": "1.1.1.1"},
+        {"kind": "tcp", "target": "1.1.1.1", "port": 443},
+        {"kind": "dns", "target": "1.1.1.1", "hostname": "www.example.com"}
+      ]
+    },
+    {
+      "name": "wan2",
+      "interface": "ens19",
+      "mode": "static",
+      "addresses": ["203.0.113.2/30"],
+      "gateway4": "203.0.113.1",
+      "metric": 200,
+      "table": 200,
+      "weight": 1,
+      "required_for_online": false,
+      "probes": [{"kind": "icmp", "target": "9.9.9.9"}]
+    }
+  ],
+
+  "bridges": [
+    {
+      "name": "br-lan",
+      "ports": ["ens20", "ens21", "ens22"],
+      "vlan_filtering": true,
+      "default_pvid": 1,
+      "trunk_ports": ["ens22"],
+      "isolated_ports": [],
+      "drop_rogue_dhcp": true
+    }
+  ],
+
+  "lans": [
+    {
+      "name": "mgmt",
+      "interface": "vl-mgmt",
+      "zone": "mgmt",
+      "vlan_id": 10,
+      "vlan_link": "br-lan",
+      "addresses": ["10.10.10.1/24"],
+      "untagged_ports": ["ens20"],
+      "description": "운영 관리 세그먼트",
+      "dhcp": {
+        "subnet": "10.10.10.0/24",
+        "pool_start": "10.10.10.100",
+        "pool_end": "10.10.10.200",
+        "domain_name": "mgmt.seoul01.mooker.internal",
+        "lease_lifetime_s": 3600
+      }
+    },
+    {
+      "name": "staff",
+      "interface": "vl-staff",
+      "zone": "staff",
+      "vlan_id": 20,
+      "vlan_link": "br-lan",
+      "addresses": ["10.20.0.1/24"],
+      "untagged_ports": ["ens21"],
+      "description": "업무용 유선/무선 단말",
+      "dhcp": {
+        "subnet": "10.20.0.0/24",
+        "pool_start": "10.20.0.100",
+        "pool_end": "10.20.0.200",
+        "domain_name": "staff.seoul01.mooker.internal",
+        "lease_lifetime_s": 7200,
+        "reservations": [
+          {"mac": "AA:BB:CC:DD:EE:01", "ip": "10.20.0.50", "hostname": "office-nas"},
+          {"mac": "AA:BB:CC:DD:EE:02", "ip": "10.20.0.51", "hostname": "reception-pc"}
+        ]
+      }
+    },
+    {
+      "name": "guest",
+      "interface": "vl-guest",
+      "zone": "guest",
+      "vlan_id": 30,
+      "vlan_link": "br-lan",
+      "addresses": ["10.30.0.1/24"],
+      "client_isolation": true,
+      "description": "방문자 Wi-Fi",
+      "dhcp": {
+        "subnet": "10.30.0.0/24",
+        "pool_start": "10.30.0.50",
+        "pool_end": "10.30.0.250",
+        "lease_lifetime_s": 1800
+      }
+    },
+    {
+      "name": "quarantine",
+      "interface": "vl-quar",
+      "zone": "quarantine",
+      "vlan_id": 99,
+      "vlan_link": "br-lan",
+      "addresses": ["10.99.0.1/24"],
+      "client_isolation": true,
+      "description": "미승인/격리 단말",
+      "dhcp": {
+        "subnet": "10.99.0.0/24",
+        "pool_start": "10.99.0.50",
+        "pool_end": "10.99.0.250",
+        "lease_lifetime_s": 600
+      }
+    }
+  ],
+
+  "vrfs": [],
+
+  "firewall": {
+    "zones": ["wan", "mgmt", "staff", "guest", "quarantine"],
+    "masquerade_wans": ["wan1", "wan2"],
+    "default_forward": "drop",
+    "zone_forward": [
+      {"from": "mgmt", "to": "wan"},
+      {"from": "staff", "to": "wan"},
+      {"from": "guest", "to": "wan"},
+      {"from": "mgmt", "to": "staff"}
+    ],
+    "forward_rules": [
+      {
+        "name": "guest-no-private",
+        "from_zone": "guest",
+        "to_zone": "wan",
+        "action": "drop",
+        "destination_cidrs": ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"],
+        "log": true
+      },
+      {
+        "name": "quarantine-no-forward",
+        "from_zone": "quarantine",
+        "to_zone": "wan",
+        "action": "drop",
+        "log": true
+      },
+      {
+        "name": "staff-nas-only-from-mgmt",
+        "from_zone": "mgmt",
+        "to_zone": "staff",
+        "action": "accept",
+        "protocol": "tcp",
+        "ports": [22, 443, 445]
+      }
+    ],
+    "service_allows": [
+      {"zone": "mgmt", "protocol": "tcp", "ports": [22], "source_cidrs": ["10.10.10.0/24"],
+       "comment": "현장 콘솔 SSH"}
+    ],
+    "port_forwards": [
+      {
+        "name": "nas-https",
+        "wan": "wan1",
+        "protocol": "tcp",
+        "wan_port": 8443,
+        "to_address": "10.20.0.50",
+        "to_port": 443,
+        "source_cidrs": ["198.51.100.0/24"]
+      }
+    ],
+    "mgmt_allow_cidrs": ["10.10.10.0/24", "10.88.0.0/24"],
+    "mgmt_ssh_port": 22,
+    "quarantine_allow_dhcp_dns": true,
+    "captive_portal_ipv4": "10.99.0.1",
+    "log_dropped": true,
+    "mss_clamp": true,
+    "invalid_ct_drop": true
+  },
+
+  "dns": {
+    "enabled": true,
+    "listen_segments": ["mgmt", "staff", "guest", "quarantine"],
+    "forwarders": ["1.1.1.1", "9.9.9.9"],
+    "forward_tls": true,
+    "forward_tls_hostnames": ["cloudflare-dns.com", "dns.quad9.net"],
+    "blocked_domains": ["malware-example.test", "phishing-example.test"],
+    "allowed_domains": ["update.mooker.io"],
+    "log_queries": false,
+    "cache_max_mb": 64,
+    "minimal_responses": true
+  },
+
+  "qos": [
+    {
+      "wan": "wan1",
+      "enabled": true,
+      "download_mbit": 480,
+      "upload_mbit": 95,
+      "mode": "diffserv4",
+      "rtt_ms": 40,
+      "nat": true,
+      "ack_filter": true,
+      "ingress_shaping": true
+    }
+  ],
+
+  "mgmt_tunnel": {
+    "enabled": false,
+    "interface": "mooker-mgmt",
+    "address": "10.88.0.11/32",
+    "private_key_ref": "mgmt-wg-private",
+    "peer_public_key": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=",
+    "peer_endpoint": "mgmt.mooker.io:51820",
+    "allowed_ips": ["10.88.0.0/24"],
+    "keepalive_s": 25,
+    "mtu": 1380
+  },
+
+  "commit_confirm": {
+    "timeout_s": 300,
+    "require_central_confirm": true
+  },
+
+  "verify": {
+    "require_wan_online": true,
+    "require_dns": true,
+    "require_control_plane": true,
+    "require_mgmt_tunnel": false,
+    "control_plane_url": "https://api.mooker.io/healthz",
+    "dns_probe_name": "www.example.com",
+    "per_check_timeout_s": 5.0,
+    "settle_delay_s": 3.0
+  }
+}
